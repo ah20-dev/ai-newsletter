@@ -229,23 +229,6 @@ sudo systemctl status crond    # Amazon Linux
 
 ---
 
-## Going public on GitHub — pre-flight checklist
-
-Before `git init && git push`:
-
-- [ ] `git status` does **not** list `.env`, `logs/run.log`, or
-      `logs/last_sent.txt`.
-- [ ] `.env` contains placeholder/empty values only on disk, real keys are
-      only on the deployed EC2 instance.
-- [ ] If you ever committed real secrets earlier, **rotate them**: Google AI
-      Studio → revoke key; `@BotFather` → `/revoke`. Removing from the working
-      tree alone is not enough once a value has been pushed anywhere.
-- [ ] `chmod 600 .env` locally if it ever holds real values.
-- [ ] No personal chat IDs left in `README.md` or `.env.example`.
-
----
-
 ## License
 
-Add a license of your choice (e.g. `MIT`) before publishing if you want others
-to be able to reuse this.
+See [LICENSE](../LICENSE) in the repository root (MIT).
