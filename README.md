@@ -40,17 +40,21 @@ On each run, `main.py`:
 ## Repository layout
 
 ```
-newsletter_bot/
-├── main.py              # orchestration, idempotency, prompt → Gemini → Telegram
-├── config.py            # .env loader, AppConfig dataclass
-├── telegram_client.py   # Bot API client with retry on 5xx/429
-├── formatter.py         # bullet normalization, 4096-char split
-├── validator.py         # structure & content checks
-├── logger.py            # file logger → logs/run.log
-├── run_with_retry.sh    # shell wrapper: 5 attempts w/ backoff (EC2)
-├── requirements.txt
-├── .env.example
-└── logs/                # run.log + last_sent.txt (gitignored)
+.
+├── README.md
+├── LICENSE
+├── .gitignore
+└── newsletter_bot/
+    ├── main.py              # orchestration, idempotency, prompt → Gemini → Telegram
+    ├── config.py            # .env loader, AppConfig dataclass
+    ├── telegram_client.py   # Bot API client with retry on 5xx/429
+    ├── formatter.py         # bullet normalization, 4096-char split
+    ├── validator.py         # structure & content checks
+    ├── logger.py            # file logger → logs/run.log
+    ├── run_with_retry.sh    # shell wrapper: 5 attempts w/ backoff (EC2)
+    ├── requirements.txt
+    ├── .env.example
+    └── logs/                # run.log + last_sent.txt (gitignored)
 ```
 
 ---
@@ -231,4 +235,4 @@ sudo systemctl status crond    # Amazon Linux
 
 ## License
 
-See [LICENSE](../LICENSE) in the repository root (MIT).
+See [LICENSE](LICENSE) in the repository root (MIT).
