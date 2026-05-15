@@ -15,7 +15,9 @@ from validator import SECTION_1_HEADER, SECTION_2_HEADER, validate_newsletter
 
 
 BASE_DIR = Path(__file__).parent
-LOG_DIR = BASE_DIR / "logs"
+_IS_LAMBDA = bool(os.environ.get("AWS_LAMBDA_FUNCTION_NAME"))
+# Lambda: only /tmp is writable; idempotency file survives warm reuse, not cold starts.
+LOG_DIR = Path("/tmp/newsletter_bot") if _IS_LAMBDA else BASE_DIR / "logs"
 LAST_SENT_FILE = LOG_DIR / "last_sent.txt"
 
 DELAY_BETWEEN_CALLS_SECONDS = 75
@@ -26,6 +28,12 @@ DELAY_BETWEEN_CALLS_SECONDS = 75
 # the next scheduled run is never blocked, longer than any plausible reboot
 # delay so we never resend the same digest.
 IDEMPOTENCY_WINDOW_HOURS = int(os.getenv("IDEMPOTENCY_WINDOW_HOURS", "20"))
+
+# Process-level retries: EC2 uses run_with_retry.sh (5 attempts). Lambda uses lambda_handler only:
+# default **1 initial + 1 retry** after **LAMBDA_RETRY_AFTER_FIRST_FAIL_MINUTES** (default 8) from first failed main().
+LAMBDA_MAX_ATTEMPTS = int(os.getenv("LAMBDA_MAX_ATTEMPTS", "2"))
+LAMBDA_RETRY_AFTER_FIRST_FAIL_MINUTES = int(os.getenv("LAMBDA_RETRY_AFTER_FIRST_FAIL_MINUTES", "8"))
+LAMBDA_POST_SLEEP_RESERVE_MS = int(os.getenv("LAMBDA_POST_SLEEP_RESERVE_MS", "240000"))
 
 
 def build_global_news_prompt() -> str:
@@ -64,6 +72,19 @@ def mark_sent_now() -> None:
     LAST_SENT_FILE.write_text(utc_now_iso(), encoding="utf-8")
 
 
+def _lambda_run_label(lambda_run: int | None, lambda_run_max: int | None) -> str:
+    if lambda_run is None or lambda_run_max is None:
+        return ""
+    return f" [Lambda run {lambda_run}/{lambda_run_max}]"
+
+
+def _bullet_count(block: str) -> int:
+    return sum(1 for line in block.strip().splitlines() if line.strip().startswith("- "))
+
+
+_PARTIAL_SECTION2_NOTE = "- Note: Markets and stocks section omitted (second Gemini request failed)."
+
+
 def generate_with_grounding(
     client: genai.Client, model: str, prompt: str, max_output_tokens: int = 1800
 ) -> str:
@@ -80,10 +101,11 @@ def generate_with_grounding(
     return (response.text or "").strip()
 
 
-def main() -> int:
+def main(*, lambda_run: int | None = None, lambda_run_max: int | None = None) -> int:
     start = time.time()
     LOG_DIR.mkdir(parents=True, exist_ok=True)
     logger = get_logger(LOG_DIR)
+    run_lbl = _lambda_run_label(lambda_run, lambda_run_max)
 
     try:
         cfg = load_config()
@@ -110,17 +132,27 @@ def main() -> int:
             client, cfg.gemini_model, build_global_news_prompt(), max_output_tokens=512
         )
     except Exception as exc:
-        log_event(logger, "error", "Gemini call 1 (news) failed", error=str(exc))
-        admin_result = telegram.send_message(
-            cfg.admin_chat_id,
-            "Newsletter generation failed: first Gemini call failed. Check logs on EC2.",
+        _run_ctx = {}
+        if lambda_run is not None:
+            _run_ctx["lambda_run"] = lambda_run
+            _run_ctx["lambda_run_max"] = lambda_run_max
+        log_event(
+            logger,
+            "error",
+            "Gemini call 1 (news) failed",
+            error=str(exc),
+            **_run_ctx,
+        )
+        alert_send = telegram.send_message(
+            cfg.telegram_chat_id,
+            f"Newsletter generation failed: first Gemini call failed.{run_lbl}",
         )
         log_event(
             logger,
             "error",
-            "Admin notified",
-            admin_notify_ok=admin_result.ok,
-            admin_status=admin_result.status_code,
+            "Failure notice sent via Telegram",
+            alert_send_ok=alert_send.ok,
+            alert_send_status=alert_send.status_code,
         )
         return 1
 
@@ -135,19 +167,68 @@ def main() -> int:
             client, cfg.gemini_model, build_stock_movers_prompt(), max_output_tokens=700
         )
     except Exception as exc:
-        log_event(logger, "error", "Gemini call 2 (stocks) failed", error=str(exc))
-        admin_result = telegram.send_message(
-            cfg.admin_chat_id,
-            "Newsletter generation failed: second Gemini call failed. Check logs on EC2.",
-        )
+        _run_ctx = {}
+        if lambda_run is not None:
+            _run_ctx["lambda_run"] = lambda_run
+            _run_ctx["lambda_run_max"] = lambda_run_max
         log_event(
             logger,
             "error",
-            "Admin notified",
-            admin_notify_ok=admin_result.ok,
-            admin_status=admin_result.status_code,
+            "Gemini call 2 (stocks) failed; delivering section 1 only",
+            error=str(exc),
+            **_run_ctx,
         )
-        return 1
+        partial_text = SECTION_1_HEADER + "\n\n" + news_bullets + "\n\n" + _PARTIAL_SECTION2_NOTE
+        try:
+            message_parts = split_for_telegram(partial_text, max_parts=2)
+        except ValueError as ferr:
+            log_event(logger, "error", "Partial newsletter split failed", error=str(ferr))
+            return 1
+
+        for idx, part in enumerate(message_parts, start=1):
+            send_result = telegram.send_message(cfg.telegram_chat_id, part)
+            log_event(
+                logger,
+                "info" if send_result.ok else "error",
+                "Telegram send result (partial newsletter)",
+                part=idx,
+                total_parts=len(message_parts),
+                status=send_result.status_code,
+                ok=send_result.ok,
+                description=send_result.description,
+                partial_delivery=True,
+            )
+            if not send_result.ok:
+                alt = telegram.send_message(
+                    cfg.telegram_chat_id,
+                    f"Partial newsletter send failed on part {idx}/{len(message_parts)}.{run_lbl}",
+                )
+                log_event(
+                    logger,
+                    "error",
+                    "Failure notice sent via Telegram (partial send)",
+                    alert_send_ok=alt.ok,
+                    alert_send_status=alt.status_code,
+                )
+                return 1
+
+        mark_sent_now()
+        duration_seconds = round(time.time() - start, 2)
+        _done_ctx = {**_run_ctx}
+        log_event(
+            logger,
+            "warning",
+            "Run completed with partial newsletter (section 2 omitted)",
+            timestamp_utc=utc_now_iso(),
+            duration_seconds=duration_seconds,
+            gemini_calls=2,
+            partial_delivery=True,
+            section1_bullets=_bullet_count(news_bullets),
+            section2_bullets=0,
+            telegram_parts_sent=len(message_parts),
+            **_done_ctx,
+        )
+        return 0
 
     stocks_bullets = normalize_newsletter(raw_stocks)
 
@@ -167,17 +248,17 @@ def main() -> int:
     try:
         message_parts = split_for_telegram(final_text, max_parts=2)
     except ValueError as exc:
-        admin_result = telegram.send_message(
-            cfg.admin_chat_id,
-            "Newsletter formatting failed: content exceeded Telegram constraints.",
+        alert_send = telegram.send_message(
+            cfg.telegram_chat_id,
+            f"Newsletter formatting failed: content exceeded Telegram constraints.{run_lbl}",
         )
         log_event(
             logger,
             "error",
             "Formatting failure",
             error=str(exc),
-            admin_notify_ok=admin_result.ok,
-            admin_status=admin_result.status_code,
+            alert_send_ok=alert_send.ok,
+            alert_send_status=alert_send.status_code,
         )
         return 1
 
@@ -194,24 +275,24 @@ def main() -> int:
             description=send_result.description,
         )
         if not send_result.ok:
-            admin_result = telegram.send_message(
-                cfg.admin_chat_id,
-                f"Newsletter send failed on part {idx}/{len(message_parts)}. Check logs.",
+            alert_send = telegram.send_message(
+                cfg.telegram_chat_id,
+                f"Newsletter send failed on part {idx}/{len(message_parts)}.{run_lbl}",
             )
             log_event(
                 logger,
                 "error",
-                "Admin alert sent for Telegram failure",
-                admin_notify_ok=admin_result.ok,
-                admin_status=admin_result.status_code,
+                "Failure notice sent via Telegram",
+                alert_send_ok=alert_send.ok,
+                alert_send_status=alert_send.status_code,
             )
             return 1
 
     mark_sent_now()
 
     duration_seconds = round(time.time() - start, 2)
-    section1_count = validation.section1_count if validation else 0
-    section2_count = validation.section2_count if validation else 0
+    section1_count = validation.section1_count
+    section2_count = validation.section2_count
     log_event(
         logger,
         "info",
@@ -224,6 +305,91 @@ def main() -> int:
         telegram_parts_sent=len(message_parts),
     )
     return 0
+
+
+def lambda_handler(event: object, context: object) -> dict[str, object]:
+    """EventBridge / console invoke. Lambda: default **2** full runs (1 + 1 retry).
+
+    After the first failed ``main()``, waits until **LAMBDA_RETRY_AFTER_FIRST_FAIL_MINUTES**
+    (default **8**) have elapsed since that failure, then runs ``main()`` again.
+
+    ``LAMBDA_MAX_ATTEMPTS`` may be ``1`` (no retry) or ``2`` (one retry). Values ``> 2`` are not
+    supported with the single delay anchor.
+
+    No VPC → default outbound internet for Gemini + Telegram.
+    Skips the retry sleep if remaining Lambda time cannot fit sleep + another full ``main()``.
+    """
+    logger = get_logger(LOG_DIR)
+
+    if LAMBDA_MAX_ATTEMPTS < 1:
+        raise ValueError(f"LAMBDA_MAX_ATTEMPTS must be >= 1; got {LAMBDA_MAX_ATTEMPTS}.")
+    if LAMBDA_MAX_ATTEMPTS > 2:
+        raise ValueError(
+            "LAMBDA_MAX_ATTEMPTS > 2 is not supported (only one post-failure delay anchor). "
+            f"Got LAMBDA_MAX_ATTEMPTS={LAMBDA_MAX_ATTEMPTS}."
+        )
+
+    retry_at_s = tuple(
+        LAMBDA_RETRY_AFTER_FIRST_FAIL_MINUTES * 60 for _ in range(max(0, LAMBDA_MAX_ATTEMPTS - 1))
+    )
+
+    t_first_fail: float | None = None
+
+    for attempt in range(1, LAMBDA_MAX_ATTEMPTS + 1):
+        code = main(lambda_run=attempt, lambda_run_max=LAMBDA_MAX_ATTEMPTS)
+        if code == 0:
+            log_event(logger, "info", "Lambda handler success", attempt=attempt)
+            return {"ok": True, "exit": 0, "attempt": attempt}
+
+        if attempt >= LAMBDA_MAX_ATTEMPTS:
+            log_event(
+                logger,
+                "error",
+                "Lambda handler exhausted attempts",
+                attempt=attempt,
+                exit=code,
+            )
+            return {"ok": False, "exit": code, "attempt": attempt}
+
+        if t_first_fail is None:
+            t_first_fail = time.time()
+
+        target_monotonic = t_first_fail + float(retry_at_s[attempt - 1])
+        delay = max(0.0, target_monotonic - time.time())
+
+        remaining_ms: int | None = None
+        if context is not None and callable(getattr(context, "get_remaining_time_in_ms", None)):
+            remaining_ms = int(context.get_remaining_time_in_ms())
+
+        min_remaining_ms = int(delay * 1000) + LAMBDA_POST_SLEEP_RESERVE_MS
+        if remaining_ms is not None and remaining_ms < min_remaining_ms:
+            log_event(
+                logger,
+                "warning",
+                "Lambda handler skipping further retries (insufficient time left)",
+                attempt=attempt,
+                delay_seconds=round(delay, 2),
+                remaining_ms=remaining_ms,
+                min_remaining_ms=min_remaining_ms,
+                exit=code,
+            )
+            return {
+                "ok": False,
+                "exit": code,
+                "attempt": attempt,
+                "reason": "insufficient_time_for_scheduled_retry",
+            }
+
+        log_event(
+            logger,
+            "info",
+            "Lambda handler retry wait (wall time from first failure)",
+            attempt=attempt,
+            delay_seconds=round(delay, 2),
+            next_attempt=attempt + 1,
+            retry_anchor_minutes=retry_at_s[attempt - 1] // 60,
+        )
+        time.sleep(delay)
 
 
 if __name__ == "__main__":

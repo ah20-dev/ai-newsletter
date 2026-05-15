@@ -33,7 +33,13 @@ class TelegramClient:
             try:
                 response = requests.post(self.url, json=payload, timeout=self.timeout_seconds)
                 last_status = response.status_code
-                body = response.json() if response.content else {}
+                body: dict | object = {}
+                if response.content:
+                    try:
+                        parsed = response.json()
+                        body = parsed if isinstance(parsed, dict) else {}
+                    except ValueError:
+                        body = {}
 
                 if response.status_code == 200 and body.get("ok") is True:
                     return TelegramSendResult(True, response.status_code, "sent")

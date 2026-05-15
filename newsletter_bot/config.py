@@ -40,7 +40,6 @@ class AppConfig:
     gemini_api_key: str
     telegram_bot_token: str
     telegram_chat_id: str
-    admin_chat_id: str
     gemini_model: str
     request_timeout_seconds: int
 
@@ -53,7 +52,6 @@ def load_config() -> AppConfig:
         "GEMINI_API_KEY",
         "TELEGRAM_BOT_TOKEN",
         "TELEGRAM_CHAT_ID",
-        "ADMIN_CHAT_ID",
     ]
     missing = [key for key in required if not os.getenv(key)]
     if missing:
@@ -63,7 +61,6 @@ def load_config() -> AppConfig:
         gemini_api_key=os.environ["GEMINI_API_KEY"],
         telegram_bot_token=os.environ["TELEGRAM_BOT_TOKEN"],
         telegram_chat_id=os.environ["TELEGRAM_CHAT_ID"],
-        admin_chat_id=os.environ["ADMIN_CHAT_ID"],
         gemini_model=os.getenv("GEMINI_MODEL", "gemini-2.5-flash-lite"),
         request_timeout_seconds=int(os.getenv("REQUEST_TIMEOUT_SECONDS", "20")),
     )

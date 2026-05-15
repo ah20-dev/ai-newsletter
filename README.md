@@ -2,8 +2,9 @@
 
 A small Python service that produces a daily two-section newsletter using
 **Google Gemini with Search grounding** and delivers it to a **Telegram** chat.
-Designed to run unattended on an EC2 instance via `cron`, with retry,
-idempotency, and reboot-safe behavior.
+Designed to run unattended on **EC2 + cron** or **AWS Lambda + EventBridge**, with
+process-level retry (shell on EC2, `lambda_handler` on Lambda), idempotency, and
+reboot-safe behavior where applicable.
 
 ---
 
@@ -29,7 +30,7 @@ On each run, `main.py`:
 7. **Splits** if the message exceeds Telegram's 4096-char limit, preferring the
    section boundary; max **2** parts (`formatter.split_for_telegram`).
 8. **Sends** via the Telegram Bot API. On send failure, posts an alert to
-   `ADMIN_CHAT_ID`.
+   `TELEGRAM_CHAT_ID`.
 9. **Marks success** by writing the current UTC ISO timestamp to
    `logs/last_sent.txt`.
 
@@ -44,6 +45,8 @@ On each run, `main.py`:
 ├── README.md
 ├── LICENSE
 ├── .gitignore
+├── terraform/             # optional: Lambda + EventBridge (see terraform/README.md)
+├── githubNewsletter/      # GitHub Actions entry (see githubNewsletter/README.md)
 └── newsletter_bot/
     ├── main.py              # orchestration, idempotency, prompt → Gemini → Telegram
     ├── config.py            # .env loader, AppConfig dataclass
@@ -64,17 +67,21 @@ On each run, `main.py`:
 | Layer | Mechanism | Where |
 |-------|-----------|-------|
 | **HTTP-level (Telegram)** | 2 attempts on 5xx / 429; honors `retry_after` from `parameters.retry_after` in the body | `telegram_client.py` |
-| **Process-level (whole run)** | 5 attempts, backoffs **3 / 7 / 12 / 15 minutes** between failures | `run_with_retry.sh` |
+| **Process-level (whole run, EC2)** | 5 attempts (1 + 4 retries), backoffs **3 / 7 / 12 / 15 minutes** between failures | `run_with_retry.sh` |
+| **Process-level (whole run, Lambda)** | Default **2 attempts** (1 + **1 retry**): second run starts **8 minutes** after first failed `main()`. `LAMBDA_MAX_ATTEMPTS=1` disables retry. | `main.py::lambda_handler` |
 | **Idempotency** | Skip if `logs/last_sent.txt` is within the last `IDEMPOTENCY_WINDOW_HOURS` (default **20h**) | `main.py::should_skip_duplicate` |
-| **Failure alerting** | Each unrecoverable failure posts a short message to `ADMIN_CHAT_ID` | `main.py` |
+| **Failure alerting** | Each unrecoverable failure posts a short message to `TELEGRAM_CHAT_ID` | `main.py` |
 
 Notes:
 - The 20h window is **less than the 24h cron cadence**, so the next scheduled
   daily run is never suppressed. Tune via `IDEMPOTENCY_WINDOW_HOURS` env var.
-- Gemini calls themselves are **not** retried inside `main.py`. A failed call
-  exits non-zero and the outer `run_with_retry.sh` will retry the entire
-  process. (`validator.build_refined_prompt` exists for future use but is not
-  currently wired in.)
+- Gemini calls themselves are **not** retried individually inside `main.py`. A
+  failed call exits non-zero; **EC2** outer `run_with_retry.sh` or **Lambda**
+  `lambda_handler` retries the **whole** process. (`validator.build_refined_prompt`
+  exists for future use but is not currently wired in.)
+- **Lambda caveat:** one retry waits until **8 minutes** after the first failed `main()`.
+  `lambda_handler` uses `get_remaining_time_in_ms` and may **skip** that sleep if
+  **sleep + `LAMBDA_POST_SLEEP_RESERVE_MS`** would not leave enough time for another full `main()`.
 
 ---
 
@@ -132,14 +139,54 @@ Exit code `0` = success; the newsletter should land in your Telegram chat.
 |----------|----------|-------------|
 | `GEMINI_API_KEY` | Yes | Gemini API key from Google AI Studio. |
 | `TELEGRAM_BOT_TOKEN` | Yes | Bot token from `@BotFather`. |
-| `TELEGRAM_CHAT_ID` | Yes | Chat ID that receives the newsletter. |
-| `ADMIN_CHAT_ID` | Yes | Chat ID for failure alerts (can equal `TELEGRAM_CHAT_ID`). |
+| `TELEGRAM_CHAT_ID` | Yes | Chat ID that receives the newsletter and failure alerts. |
 | `GEMINI_MODEL` | No | Defaults to `gemini-2.5-flash-lite`. |
 | `REQUEST_TIMEOUT_SECONDS` | No | Telegram HTTP timeout. Default `20`. |
 | `IDEMPOTENCY_WINDOW_HOURS` | No | Skip-duplicate window. Default `20`. |
+| `LAMBDA_MAX_ATTEMPTS` | No | Lambda only. Default `2` (= 1 run + 1 retry). Use `1` for no process-level retry. |
+| `LAMBDA_RETRY_AFTER_FIRST_FAIL_MINUTES` | No | Lambda only. Default `8` (minutes from first failed `main()` until the retry run). |
+| `LAMBDA_POST_SLEEP_RESERVE_MS` | No | Lambda only. Milliseconds reserved after the scheduled sleep for the next full `main()`. Default `240000` (~4m); raise if time guard skips retry too often. |
 
-Secrets live **only** in `.env`. The repo's `.gitignore` excludes `.env*`
-(except `.env.example`). On EC2 also `chmod 600 .env`.
+Secrets: **`.env`** on EC2/local (gitignored). On **Lambda**, set the same keys as **function environment variables** (console or IaC).
+
+---
+
+## Lambda (minimal, no VPC)
+
+Default Lambda has **outbound internet** for Gemini + Telegram. **Do not** attach a VPC unless you add a NAT — VPC without NAT blocks public API calls.
+
+1. **Build zip (Linux, same arch as function: x86_64 vs arm64)** — from repo root:
+
+   ```bash
+   mkdir -p build/lambda && rm -rf build/lambda/*
+   docker run --rm \
+     -v "$(pwd)/newsletter_bot:/src:ro" \
+     -v "$(pwd)/build/lambda:/out" \
+     public.ecr.aws/lambda/python:3.12 \
+     bash -c 'pip install -r /src/requirements.txt -t /out && cp /src/*.py /out/'
+   (cd build/lambda && zip -r ../newsletter-lambda.zip .)
+   ```
+
+   Upload `build/newsletter-lambda.zip` to the function.
+
+2. Create function: **Python 3.12**, handler **`main.lambda_handler`**, upload zip, **timeout 900 s** (AWS max = 15m; must cover **8m** retry wait + second full `main()` including **75s** Gemini gap—see **Retry & idempotency**), memory **512 MB** (tune down if you want).
+
+3. **Configuration → Environment variables**: `GEMINI_API_KEY`, `TELEGRAM_BOT_TOKEN`, `TELEGRAM_CHAT_ID`, optional `GEMINI_MODEL`, `IDEMPOTENCY_WINDOW_HOURS`, `REQUEST_TIMEOUT_SECONDS`.
+
+4. **EventBridge (or EventBridge Scheduler):** rule with schedule (e.g. `cron(0 17 * * ? *)` for 17:00 UTC), target = this Lambda. Optional: on the target, set **retry attempts = 0** if you do not want AWS to re-invoke after errors (can mean duplicate sends depending on failure timing). **IaC:** see [`terraform/`](terraform/) and [`terraform/README.md`](terraform/README.md).
+
+**Note:** Idempotency uses **`/tmp/newsletter_bot`** on Lambda—writable there; state **persists across warm invocations** and is **lost on cold start** (not “wiped after every execution”). One schedule per day + no concurrent invocations is usually enough; for stronger guarantees you’d add S3/DynamoDB (not included here).
+
+**IAM:** Lambda needs **no SES**; outbound HTTPS to Gemini + Telegram only. Attach **AWSLambdaBasicExecutionRole** (CloudWatch Logs) unless you add VPC/NAT yourself.
+
+---
+
+## GitHub Actions (scheduled)
+
+No server required. Add repo secrets (same keys as `.env`), then enable
+[`.github/workflows/newsletter.yml`](.github/workflows/newsletter.yml).
+Entry point: [`githubNewsletter/newsletter.py`](githubNewsletter/newsletter.py) — see
+[`githubNewsletter/README.md`](githubNewsletter/README.md).
 
 ---
 
@@ -225,7 +272,7 @@ sudo systemctl status crond    # Amazon Linux
 
 | Symptom | Where to look |
 |---------|---------------|
-| Exit code 1 | `logs/run.log` last entries — Gemini error, Telegram error, or formatting error. Admin chat will also have an alert. |
+| Exit code 1 | `logs/run.log` last entries — Gemini error, Telegram error, or formatting error. Telegram chat may also get a failure alert. |
 | No Telegram message arrived | Verify `TELEGRAM_BOT_TOKEN` and `TELEGRAM_CHAT_ID`; message your bot once from the target chat so the bot can reach it. |
 | Validation warnings only | Bullet count or ticker/`%` rule failed; the digest is still sent. Tune the prompts in `main.py` if you want stricter output. |
 | Run fired at the wrong wall-clock time | See **Timezone dependency** above; check `timedatectl`. |

@@ -1,19 +1,29 @@
 import logging
+import os
+import sys
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
 
 def get_logger(log_dir: Path) -> logging.Logger:
-    log_dir.mkdir(parents=True, exist_ok=True)
-    log_path = log_dir / "run.log"
-
     logger = logging.getLogger("newsletter_bot")
     logger.setLevel(logging.INFO)
     logger.propagate = False
 
     if logger.handlers:
         return logger
+
+    if os.environ.get("AWS_LAMBDA_FUNCTION_NAME"):
+        stream = logging.StreamHandler(sys.stdout)
+        stream.setFormatter(
+            logging.Formatter("%(levelname)s | %(message)s"),
+        )
+        logger.addHandler(stream)
+        return logger
+
+    log_dir.mkdir(parents=True, exist_ok=True)
+    log_path = log_dir / "run.log"
 
     file_handler = logging.FileHandler(log_path)
     formatter = logging.Formatter(
