@@ -199,8 +199,9 @@ def main(*, lambda_run: int | None = None, lambda_run_max: int | None = None) ->
                 partial_delivery=True,
             )
             if not send_result.ok:
-                # At least one prior part reached Telegram; record so Lambda retry / full run
-                # does not re-send section 1 (idempotency window covers retry ~8m later).
+                # Part 1+ already reached Telegram: record idempotency so Lambda retry / next run
+                # does not re-send those parts (duplicate). Tradeoff: retry may skip until window
+                # expires; fix Telegram / clear last_sent if you must force a full resend.
                 if idx > 1:
                     mark_sent_now()
                     log_event(
@@ -287,6 +288,17 @@ def main(*, lambda_run: int | None = None, lambda_run_max: int | None = None) ->
             description=send_result.description,
         )
         if not send_result.ok:
+            # At least one prior part reached Telegram: record so retry / later run does not
+            # re-send section 1 (idempotency). Tradeoff: Lambda retry may skip until window expires.
+            if idx > 1:
+                mark_sent_now()
+                log_event(
+                    logger,
+                    "warning",
+                    "Newsletter: recorded send after part success (mid-stream Telegram failure)",
+                    parts_ok_before_fail=idx - 1,
+                    total_parts=len(message_parts),
+                )
             alert_send = telegram.send_message(
                 cfg.telegram_chat_id,
                 f"Newsletter send failed on part {idx}/{len(message_parts)}.{run_lbl}",
