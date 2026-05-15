@@ -46,7 +46,6 @@ On each run, `main.py`:
 ├── LICENSE
 ├── .gitignore
 ├── terraform/             # optional: Lambda + EventBridge (see terraform/README.md)
-├── githubNewsletter/      # GitHub Actions entry (see githubNewsletter/README.md)
 └── newsletter_bot/
     ├── main.py              # orchestration, idempotency, prompt → Gemini → Telegram
     ├── config.py            # .env loader, AppConfig dataclass
@@ -178,15 +177,6 @@ Default Lambda has **outbound internet** for Gemini + Telegram. **Do not** attac
 **Note:** Idempotency uses **`/tmp/newsletter_bot`** on Lambda—writable there; state **persists across warm invocations** and is **lost on cold start** (not “wiped after every execution”). One schedule per day + no concurrent invocations is usually enough; for stronger guarantees you’d add S3/DynamoDB (not included here).
 
 **IAM:** Lambda needs **no SES**; outbound HTTPS to Gemini + Telegram only. Attach **AWSLambdaBasicExecutionRole** (CloudWatch Logs) unless you add VPC/NAT yourself.
-
----
-
-## GitHub Actions (scheduled)
-
-No server required. Add repo secrets (same keys as `.env`), then enable
-[`.github/workflows/newsletter.yml`](.github/workflows/newsletter.yml).
-Entry point: [`githubNewsletter/newsletter.py`](githubNewsletter/newsletter.py) — see
-[`githubNewsletter/README.md`](githubNewsletter/README.md).
 
 ---
 

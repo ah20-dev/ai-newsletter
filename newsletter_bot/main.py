@@ -199,6 +199,18 @@ def main(*, lambda_run: int | None = None, lambda_run_max: int | None = None) ->
                 partial_delivery=True,
             )
             if not send_result.ok:
+                # At least one prior part reached Telegram; record so Lambda retry / full run
+                # does not re-send section 1 (idempotency window covers retry ~8m later).
+                if idx > 1:
+                    mark_sent_now()
+                    log_event(
+                        logger,
+                        "warning",
+                        "Partial newsletter: recorded send after part success (mid-stream failure)",
+                        parts_ok_before_fail=idx - 1,
+                        total_parts=len(message_parts),
+                        partial_delivery=True,
+                    )
                 alt = telegram.send_message(
                     cfg.telegram_chat_id,
                     f"Partial newsletter send failed on part {idx}/{len(message_parts)}.{run_lbl}",
@@ -390,6 +402,10 @@ def lambda_handler(event: object, context: object) -> dict[str, object]:
             retry_anchor_minutes=retry_at_s[attempt - 1] // 60,
         )
         time.sleep(delay)
+
+    # Defensive: loop should always return (success, exhausted attempts, or time guard).
+    log_event(logger, "error", "Lambda handler exited retry loop without return (bug)")
+    return {"ok": False, "exit": 1, "reason": "unexpected_handler_exit"}
 
 
 if __name__ == "__main__":
