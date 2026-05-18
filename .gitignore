@@ -17,6 +17,9 @@ venv/
 .venv/
 env/
 
+# Lambda build artifacts
+build/
+
 # Logs / runtime state
 **/logs/*.log
 **/logs/*.txt

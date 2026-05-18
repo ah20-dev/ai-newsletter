@@ -1,6 +1,6 @@
 #!/bin/bash
 set -e
-cd /home/ssm-user/newsletter_bot
+cd /home/ubuntu/newsletter_bot
 source venv/bin/activate
 
 # Retry delays in seconds: 3min, 7min, 12min, 15min

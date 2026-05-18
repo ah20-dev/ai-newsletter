@@ -13,20 +13,27 @@ reboot-safe behavior where applicable.
 On each run, `main.py`:
 
 1. **Loads config** from `.env` (`config.py`).
-2. **Idempotency guard** — if `logs/last_sent.txt` shows a successful send within
-   the configured window (default **20 hours**), exit `0` immediately. This
+2. **Idempotency guard** — if the last-success timestamp file shows a send within
+   the configured window (default **20 hours**), exit `0` immediately. Path:
+   `newsletter_bot/logs/last_sent.txt` on EC2/local; `/tmp/newsletter_bot/last_sent.txt`
+   on Lambda. This
    stops `@reboot` cron, manual reruns, and bash-level retries from posting the
    same digest twice the same day.
 3. **Gemini call 1 — Global news**: prompt asks for top ~12 headlines from the
    last 24h. Tool: `google_search` grounding. Output normalized to `- ` bullets
-   (`formatter.normalize_newsletter`).
+   (`formatter.normalize_newsletter`). On failure: Telegram alert, exit `1` (no
+   partial send).
 4. **Sleeps 75 seconds** to stay under Gemini per-minute rate limits.
 5. **Gemini call 2 — US market movers**: top ~20 stocks with `$TICKER`, `%`
-   move (when available), and catalyst (when available).
+   move (when available), and catalyst (when available). If this call **fails**,
+   delivers a **partial** newsletter (section 1 + omission note), sends via
+   Telegram (up to 2 parts), writes `last_sent.txt`, and exits `0` — counts as
+   a successful idempotency run (steps 6–8 skipped on this path).
 6. **Validates** the composed message (`validator.validate_newsletter`):
-   section headers present and ordered, bullet counts within bounds, section 2
-   bullets contain a ticker and `%`. Failures are **logged** but do not block
-   sending.
+   exact headers `SECTION 1: Global News Brief` / `SECTION 2: Markets & Stocks Brief`,
+   section 1 bullets **5–12**, section 2 **5–15**, each section 2 bullet needs a
+   ticker (`$TICKER` or `(TICKER)`) and `%`. Failures are **logged** but do not block
+   sending on the full-newsletter path.
 7. **Splits** if the message exceeds Telegram's 4096-char limit, preferring the
    section boundary; max **2** parts (`formatter.split_for_telegram`).
 8. **Sends** via the Telegram Bot API. On send failure, posts an alert to
@@ -34,7 +41,9 @@ On each run, `main.py`:
 9. **Marks success** by writing the current UTC ISO timestamp to
    `logs/last_sent.txt`.
 
-**Hard caps per run:** 2 Gemini calls, 2 Telegram messages.
+**Hard caps per run:** 2 Gemini calls; up to **2 Telegram newsletter parts** (split
+at section boundary). Failure **alerts** are separate short messages and do not
+count toward the part limit.
 
 ---
 
@@ -44,7 +53,8 @@ On each run, `main.py`:
 .
 ├── README.md
 ├── LICENSE
-├── .gitignore
+├── .gitignore             # secrets, logs, venv, .cursor/, etc.
+├── build/                 # ephemeral Lambda zip (gitignored; see Lambda section)
 ├── terraform/             # optional: Lambda + EventBridge (see terraform/README.md)
 └── newsletter_bot/
     ├── main.py              # orchestration, idempotency, prompt → Gemini → Telegram
@@ -74,13 +84,18 @@ On each run, `main.py`:
 Notes:
 - The 20h window is **less than the 24h cron cadence**, so the next scheduled
   daily run is never suppressed. Tune via `IDEMPOTENCY_WINDOW_HOURS` env var.
-- Gemini calls themselves are **not** retried individually inside `main.py`. A
-  failed call exits non-zero; **EC2** outer `run_with_retry.sh` or **Lambda**
-  `lambda_handler` retries the **whole** process. (`validator.build_refined_prompt`
+- Gemini calls are **not** retried individually inside `main.py`. **Call 1** failure
+  exits non-zero; **call 2** failure may exit `0` after partial delivery (see step 5).
+  **EC2** `run_with_retry.sh` or **Lambda** `lambda_handler` retries the **whole**
+  process on non-zero exit. (`validator.build_refined_prompt`
   exists for future use but is not currently wired in.)
 - **Lambda caveat:** one retry waits until **8 minutes** after the first failed `main()`.
   `lambda_handler` uses `get_remaining_time_in_ms` and may **skip** that sleep if
   **sleep + `LAMBDA_POST_SLEEP_RESERVE_MS`** would not leave enough time for another full `main()`.
+- **Multi-part Telegram send:** if part 1 succeeds and a later part fails, `main.py`
+  still writes `last_sent.txt` so a process-level retry does not re-send part 1.
+  Tradeoff: outer retry may skip until the idempotency window expires; delete
+  `last_sent.txt` or wait out the window to force a full resend.
 
 ---
 
@@ -90,13 +105,14 @@ The bot itself uses **UTC internally** (timestamps in `last_sent.txt` and
 logs). However, the **schedule** is timezone-sensitive — make sure cron and
 the host clock are aligned.
 
-- The README's example cron line is `0 17 * * *` which is **17:00 UTC**.
-  - `17:00 UTC` ≈ `12:00 EST` (UTC−5, standard time, winter)
-  - `17:00 UTC` ≈ `13:00 EDT` (UTC−4, daylight time, summer)
+- The README's example cron line is `0 16 * * *` which is **16:00 UTC** (same as
+  Terraform default). EventBridge rules are UTC-only.
+  - `16:00 UTC` ≈ `11:00 EST` (UTC−5, standard time, winter)
+  - `16:00 UTC` ≈ `12:00 EDT` (UTC−4, daylight time, summer)
   - During DST switches, the local-clock send time drifts by 1 hour. If you
     want a stable local-clock time, either:
     1. Set the EC2 system timezone to your local zone (`sudo timedatectl
-       set-timezone America/New_York`) and use `0 12 * * *` in cron, or
+       set-timezone America/New_York`) and use `0 11 * * *` in cron, or
     2. Keep UTC system time and adjust the cron hour twice a year.
 - Verify the box is on UTC (recommended for EC2): `timedatectl` should show
   `Time zone: Etc/UTC` or `UTC`.
@@ -170,9 +186,9 @@ Default Lambda has **outbound internet** for Gemini + Telegram. **Do not** attac
 
 2. Create function: **Python 3.12**, handler **`main.lambda_handler`**, upload zip, **timeout 900 s** (AWS max = 15m; must cover **8m** retry wait + second full `main()` including **75s** Gemini gap—see **Retry & idempotency**), memory **512 MB** (tune down if you want).
 
-3. **Configuration → Environment variables**: `GEMINI_API_KEY`, `TELEGRAM_BOT_TOKEN`, `TELEGRAM_CHAT_ID`, optional `GEMINI_MODEL`, `IDEMPOTENCY_WINDOW_HOURS`, `REQUEST_TIMEOUT_SECONDS`.
+3. **Configuration → Environment variables**: `GEMINI_API_KEY`, `TELEGRAM_BOT_TOKEN`, `TELEGRAM_CHAT_ID`, optional `GEMINI_MODEL`, `IDEMPOTENCY_WINDOW_HOURS`, `REQUEST_TIMEOUT_SECONDS`, and Lambda retry tuning (`LAMBDA_MAX_ATTEMPTS`, `LAMBDA_RETRY_AFTER_FIRST_FAIL_MINUTES`, `LAMBDA_POST_SLEEP_RESERVE_MS` — see **Configuration**).
 
-4. **EventBridge (or EventBridge Scheduler):** rule with schedule (e.g. `cron(0 17 * * ? *)` for 17:00 UTC), target = this Lambda. Optional: on the target, set **retry attempts = 0** if you do not want AWS to re-invoke after errors (can mean duplicate sends depending on failure timing). **IaC:** see [`terraform/`](terraform/) and [`terraform/README.md`](terraform/README.md).
+4. **EventBridge (or EventBridge Scheduler):** rule with schedule (e.g. `cron(0 16 * * ? *)` for 16:00 UTC), target = this Lambda. Optional: on the target, set **retry attempts = 0** if you do not want AWS to re-invoke after errors (can mean duplicate sends depending on failure timing). **IaC:** see [`terraform/`](terraform/) and [`terraform/README.md`](terraform/README.md) (Terraform default schedule is also 16:00 UTC).
 
 **Note:** Idempotency uses **`/tmp/newsletter_bot`** on Lambda—writable there; state **persists across warm invocations** and is **lost on cold start** (not “wiped after every execution”). One schedule per day + no concurrent invocations is usually enough; for stronger guarantees you’d add S3/DynamoDB (not included here).
 
@@ -198,6 +214,7 @@ cp .env.example .env
 nano .env                  # paste real keys
 chmod 600 .env
 chmod +x run_with_retry.sh
+# run_with_retry.sh uses `bc` for retry delay labels (install: sudo apt install bc)
 
 # 4. Smoke test
 python main.py && tail -n 50 logs/run.log
@@ -211,8 +228,8 @@ Cron jobs already survive EC2 stop/start because crontabs are stored on disk.
 What we add below is **automatic recovery on reboot** (e.g. after an OS patch
 or instance restart) without risking duplicate sends.
 
-Edit the path in `run_with_retry.sh` (`cd /home/ssm-user/newsletter_bot`) to
-match your install location, then:
+Edit the path in `run_with_retry.sh` (`cd /home/ubuntu/newsletter_bot`) if your
+install location differs, then:
 
 ```bash
 crontab -e
@@ -221,8 +238,8 @@ crontab -e
 Append both lines:
 
 ```cron
-# Daily run at 17:00 UTC (~12:00 EST / 13:00 EDT)
-0 17 * * * /home/ubuntu/newsletter_bot/run_with_retry.sh >> /home/ubuntu/newsletter_bot/logs/run.log 2>&1
+# Daily run at 16:00 UTC (~11:00 EST / 12:00 EDT)
+0 16 * * * /home/ubuntu/newsletter_bot/run_with_retry.sh >> /home/ubuntu/newsletter_bot/logs/run.log 2>&1
 
 # Reboot recovery: also try after every boot. The 20h idempotency window in
 # main.py prevents duplicate sends if the daily run already succeeded.
@@ -236,7 +253,7 @@ How the reboot path is safe:
 - On reboot, `@reboot` runs the wrapper. `main.py` sees the recent timestamp,
   the elapsed time is `<= IDEMPOTENCY_WINDOW_HOURS`, and it exits early with a
   log line `Idempotency skip | reason=already_sent_within_window`.
-- If the daily run was missed entirely (instance down at 17:00 UTC), the
+- If the daily run was missed entirely (instance down at 16:00 UTC), the
   `@reboot` run will see no recent `last_sent.txt` (or one older than the
   window) and will actually post the digest — recovering the missed day.
 
@@ -252,9 +269,11 @@ sudo systemctl status crond    # Amazon Linux
 
 ## Logs & runtime state
 
-- `logs/run.log` — append-only, structured `key=value` lines.
-- `logs/last_sent.txt` — single ISO-8601 UTC timestamp of last successful send.
-  Delete this file to force the next run to fire regardless of the window.
+- **EC2 / local:** `logs/run.log` — append-only, structured `key=value` lines.
+  `logs/last_sent.txt` — single ISO-8601 UTC timestamp of last successful send.
+- **Lambda:** logs go to **CloudWatch** (stdout via `logger.py`); idempotency state
+  is `/tmp/newsletter_bot/last_sent.txt` (warm invocations only).
+- Delete `last_sent.txt` to force the next run to fire regardless of the window.
 
 ---
 
@@ -262,9 +281,11 @@ sudo systemctl status crond    # Amazon Linux
 
 | Symptom | Where to look |
 |---------|---------------|
-| Exit code 1 | `logs/run.log` last entries — Gemini error, Telegram error, or formatting error. Telegram chat may also get a failure alert. |
+| Exit code 1 | EC2/local: `logs/run.log`. Lambda: CloudWatch log group. Last entries — Gemini call 1 error, Telegram error, or formatting error. Telegram chat may also get a failure alert. |
+| Telegram shows `400` / parse errors | Messages use `parse_mode=Markdown`; odd `$` or `_` in bullets can break parsing. See `telegram_client.py`. |
 | No Telegram message arrived | Verify `TELEGRAM_BOT_TOKEN` and `TELEGRAM_CHAT_ID`; message your bot once from the target chat so the bot can reach it. |
 | Validation warnings only | Bullet count or ticker/`%` rule failed; the digest is still sent. Tune the prompts in `main.py` if you want stricter output. |
+| Section 2 missing / “Markets section omitted” note | Second Gemini call failed; partial delivery by design (section 1 still sent). |
 | Run fired at the wrong wall-clock time | See **Timezone dependency** above; check `timedatectl`. |
 | `@reboot` job re-sent the digest | `IDEMPOTENCY_WINDOW_HOURS` is too low or `logs/last_sent.txt` was wiped; defaults should prevent this. |
 
