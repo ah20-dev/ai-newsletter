@@ -51,8 +51,8 @@ Override: `-var='schedule_expression=cron(0 16 * * ? *)'`
 | `gemini_model` | `GEMINI_MODEL` | `gemini-2.5-flash-lite` |
 | `idempotency_window_hours` | `IDEMPOTENCY_WINDOW_HOURS` | `20` |
 | `request_timeout_seconds` | `REQUEST_TIMEOUT_SECONDS` | `20` |
-| `lambda_max_attempts` | `LAMBDA_MAX_ATTEMPTS` | `2` |
-| `lambda_retry_after_first_fail_minutes` | `LAMBDA_RETRY_AFTER_FIRST_FAIL_MINUTES` | `8` |
+| `lambda_max_attempts` | `LAMBDA_MAX_ATTEMPTS` | `3` |
+| `lambda_retry_after_first_fail_minutes` | `LAMBDA_RETRY_AFTER_FIRST_FAIL_MINUTES` | `15` |
 | `lambda_post_sleep_reserve_ms` | `LAMBDA_POST_SLEEP_RESERVE_MS` | `240000` |
 
 Empty optional strings are omitted from the function environment (app defaults apply).
@@ -66,8 +66,8 @@ terraform apply \
   -var="telegram_bot_token=$TELEGRAM_BOT_TOKEN" \
   -var="telegram_chat_id=$TELEGRAM_CHAT_ID" \
   -var='idempotency_window_hours=20' \
-  -var='lambda_max_attempts=2' \
-  -var='lambda_retry_after_first_fail_minutes=8' \
+  -var='lambda_max_attempts=3' \
+  -var='lambda_retry_after_first_fail_minutes=15' \
   -var='lambda_post_sleep_reserve_ms=240000'
 ```
 

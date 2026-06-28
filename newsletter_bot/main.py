@@ -29,10 +29,10 @@ DELAY_BETWEEN_CALLS_SECONDS = 75
 # delay so we never resend the same digest.
 IDEMPOTENCY_WINDOW_HOURS = int(os.getenv("IDEMPOTENCY_WINDOW_HOURS", "20"))
 
-# Process-level retries: EC2 uses run_with_retry.sh (5 attempts). Lambda uses lambda_handler only:
-# default **1 initial + 1 retry** after **LAMBDA_RETRY_AFTER_FIRST_FAIL_MINUTES** (default 8) from first failed main().
-LAMBDA_MAX_ATTEMPTS = int(os.getenv("LAMBDA_MAX_ATTEMPTS", "2"))
-LAMBDA_RETRY_AFTER_FIRST_FAIL_MINUTES = int(os.getenv("LAMBDA_RETRY_AFTER_FIRST_FAIL_MINUTES", "8"))
+# Process-level retries: EC2 uses run_with_retry.sh (3 attempts). Lambda uses lambda_handler only:
+# default **1 initial + 2 retries**, **15 minutes** apart (anchor: 15m, 30m from first failure).
+LAMBDA_MAX_ATTEMPTS = int(os.getenv("LAMBDA_MAX_ATTEMPTS", "3"))
+LAMBDA_RETRY_AFTER_FIRST_FAIL_MINUTES = int(os.getenv("LAMBDA_RETRY_AFTER_FIRST_FAIL_MINUTES", "15"))
 LAMBDA_POST_SLEEP_RESERVE_MS = int(os.getenv("LAMBDA_POST_SLEEP_RESERVE_MS", "240000"))
 
 
@@ -332,29 +332,25 @@ def main(*, lambda_run: int | None = None, lambda_run_max: int | None = None) ->
 
 
 def lambda_handler(event: object, context: object) -> dict[str, object]:
-    """EventBridge / console invoke. Lambda: default **2** full runs (1 + 1 retry).
+    """EventBridge / console invoke. Lambda: default **3** full runs (1 + 2 retries).
 
-    After the first failed ``main()``, waits until **LAMBDA_RETRY_AFTER_FIRST_FAIL_MINUTES**
-    (default **8**) have elapsed since that failure, then runs ``main()`` again.
+    After each failed ``main()``, waits until the next **15-minute** slot from the first
+    failure (15m, then 30m), then runs ``main()`` again.
 
-    ``LAMBDA_MAX_ATTEMPTS`` may be ``1`` (no retry) or ``2`` (one retry). Values ``> 2`` are not
-    supported with the single delay anchor.
+    ``LAMBDA_MAX_ATTEMPTS`` may be ``1`` (no retry) or higher. Spacing uses
+    ``LAMBDA_RETRY_AFTER_FIRST_FAIL_MINUTES`` × attempt index from first failure.
 
     No VPC → default outbound internet for Gemini + Telegram.
-    Skips the retry sleep if remaining Lambda time cannot fit sleep + another full ``main()``.
+    Skips further retries if remaining Lambda time cannot fit sleep + another full ``main()``.
     """
     logger = get_logger(LOG_DIR)
 
     if LAMBDA_MAX_ATTEMPTS < 1:
         raise ValueError(f"LAMBDA_MAX_ATTEMPTS must be >= 1; got {LAMBDA_MAX_ATTEMPTS}.")
-    if LAMBDA_MAX_ATTEMPTS > 2:
-        raise ValueError(
-            "LAMBDA_MAX_ATTEMPTS > 2 is not supported (only one post-failure delay anchor). "
-            f"Got LAMBDA_MAX_ATTEMPTS={LAMBDA_MAX_ATTEMPTS}."
-        )
 
     retry_at_s = tuple(
-        LAMBDA_RETRY_AFTER_FIRST_FAIL_MINUTES * 60 for _ in range(max(0, LAMBDA_MAX_ATTEMPTS - 1))
+        LAMBDA_RETRY_AFTER_FIRST_FAIL_MINUTES * 60 * (i + 1)
+        for i in range(max(0, LAMBDA_MAX_ATTEMPTS - 1))
     )
 
     t_first_fail: float | None = None

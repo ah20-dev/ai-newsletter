@@ -63,7 +63,7 @@ count toward the part limit.
     ├── formatter.py         # bullet normalization, 4096-char split
     ├── validator.py         # structure & content checks
     ├── logger.py            # file logger → logs/run.log
-    ├── run_with_retry.sh    # shell wrapper: 5 attempts w/ backoff (EC2)
+    ├── run_with_retry.sh    # shell wrapper: 3 attempts w/ 15m backoff (EC2)
     ├── requirements.txt
     ├── .env.example
     └── logs/                # run.log + last_sent.txt (gitignored)
@@ -76,8 +76,8 @@ count toward the part limit.
 | Layer | Mechanism | Where |
 |-------|-----------|-------|
 | **HTTP-level (Telegram)** | 2 attempts on 5xx / 429; honors `retry_after` from `parameters.retry_after` in the body | `telegram_client.py` |
-| **Process-level (whole run, EC2)** | 5 attempts (1 + 4 retries), backoffs **3 / 7 / 12 / 15 minutes** between failures | `run_with_retry.sh` |
-| **Process-level (whole run, Lambda)** | Default **2 attempts** (1 + **1 retry**): second run starts **8 minutes** after first failed `main()`. `LAMBDA_MAX_ATTEMPTS=1` disables retry. | `main.py::lambda_handler` |
+| **Process-level (whole run, EC2)** | **3 attempts** (1 + 2 retries), **15 minutes** between failures | `run_with_retry.sh` |
+| **Process-level (whole run, Lambda)** | Default **3 attempts** (1 + **2 retries**): retries at **15m** and **30m** from first failed `main()`. `LAMBDA_MAX_ATTEMPTS=1` disables retry. | `main.py::lambda_handler` |
 | **Idempotency** | Skip if `logs/last_sent.txt` is within the last `IDEMPOTENCY_WINDOW_HOURS` (default **20h**) | `main.py::should_skip_duplicate` |
 | **Failure alerting** | Each unrecoverable failure posts a short message to `TELEGRAM_CHAT_ID` | `main.py` |
 
@@ -89,9 +89,8 @@ Notes:
   **EC2** `run_with_retry.sh` or **Lambda** `lambda_handler` retries the **whole**
   process on non-zero exit. (`validator.build_refined_prompt`
   exists for future use but is not currently wired in.)
-- **Lambda caveat:** one retry waits until **8 minutes** after the first failed `main()`.
-  `lambda_handler` uses `get_remaining_time_in_ms` and may **skip** that sleep if
-  **sleep + `LAMBDA_POST_SLEEP_RESERVE_MS`** would not leave enough time for another full `main()`.
+- **Lambda caveat:** up to **2 retries**, scheduled **15 minutes** apart from the first failure (at 15m and 30m). `lambda_handler` uses `get_remaining_time_in_ms` and may **skip** further retries if sleep + `LAMBDA_POST_SLEEP_RESERVE_MS` would not leave enough time for another full `main()`.
+  With the **900 s Lambda max timeout**, even one 15 m retry often leaves no room for a second full `main()` (75 s Gemini gap + two calls); **3 attempts with 15 m spacing cannot fit** in a single invocation. EC2 `run_with_retry.sh` has no such cap. For Lambda, use EventBridge re-invocation, lower `LAMBDA_RETRY_AFTER_FIRST_FAIL_MINUTES`, or accept time-guard skips.
 - **Multi-part Telegram send:** if part 1 succeeds and a later part fails, `main.py`
   still writes `last_sent.txt` so a process-level retry does not re-send part 1.
   Tradeoff: outer retry may skip until the idempotency window expires; delete
@@ -158,8 +157,8 @@ Exit code `0` = success; the newsletter should land in your Telegram chat.
 | `GEMINI_MODEL` | No | Defaults to `gemini-2.5-flash-lite`. |
 | `REQUEST_TIMEOUT_SECONDS` | No | Telegram HTTP timeout. Default `20`. |
 | `IDEMPOTENCY_WINDOW_HOURS` | No | Skip-duplicate window. Default `20`. |
-| `LAMBDA_MAX_ATTEMPTS` | No | Lambda only. Default `2` (= 1 run + 1 retry). Use `1` for no process-level retry. |
-| `LAMBDA_RETRY_AFTER_FIRST_FAIL_MINUTES` | No | Lambda only. Default `8` (minutes from first failed `main()` until the retry run). |
+| `LAMBDA_MAX_ATTEMPTS` | No | Lambda only. Default `3` (= 1 run + 2 retries). Use `1` for no process-level retry. |
+| `LAMBDA_RETRY_AFTER_FIRST_FAIL_MINUTES` | No | Lambda only. Default `15`. Retry slots at 15m, 30m, … from first failed `main()`. |
 | `LAMBDA_POST_SLEEP_RESERVE_MS` | No | Lambda only. Milliseconds reserved after the scheduled sleep for the next full `main()`. Default `240000` (~4m); raise if time guard skips retry too often. |
 
 Secrets: **`.env`** on EC2/local (gitignored). On **Lambda**, set the same keys as **function environment variables** (console or IaC).
@@ -184,7 +183,7 @@ Default Lambda has **outbound internet** for Gemini + Telegram. **Do not** attac
 
    Upload `build/newsletter-lambda.zip` to the function.
 
-2. Create function: **Python 3.12**, handler **`main.lambda_handler`**, upload zip, **timeout 900 s** (AWS max = 15m; must cover **8m** retry wait + second full `main()` including **75s** Gemini gap—see **Retry & idempotency**), memory **512 MB** (tune down if you want).
+2. Create function: **Python 3.12**, handler **`main.lambda_handler`**, upload zip, **timeout 900 s** (AWS max = 15m; in-handler **3×15m retries do not fit**—see **Retry & idempotency**; EC2 or EventBridge for full retry cadence), memory **512 MB** (tune down if you want).
 
 3. **Configuration → Environment variables**: `GEMINI_API_KEY`, `TELEGRAM_BOT_TOKEN`, `TELEGRAM_CHAT_ID`, optional `GEMINI_MODEL`, `IDEMPOTENCY_WINDOW_HOURS`, `REQUEST_TIMEOUT_SECONDS`, and Lambda retry tuning (`LAMBDA_MAX_ATTEMPTS`, `LAMBDA_RETRY_AFTER_FIRST_FAIL_MINUTES`, `LAMBDA_POST_SLEEP_RESERVE_MS` — see **Configuration**).
 

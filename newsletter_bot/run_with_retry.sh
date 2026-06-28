@@ -3,9 +3,9 @@ set -e
 cd /home/ubuntu/newsletter_bot
 source venv/bin/activate
 
-# Retry delays in seconds: 3min, 7min, 12min, 15min
-DELAYS=(180 420 720 900)
-MAX_ATTEMPTS=5  # 1 initial + 4 retries
+# Retry delays in seconds: 15min between each failure (2 retries after initial run)
+DELAYS=(900 900)
+MAX_ATTEMPTS=3  # 1 initial + 2 retries
 
 attempt=1
 
