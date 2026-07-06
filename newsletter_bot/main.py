@@ -145,7 +145,7 @@ def main(*, lambda_run: int | None = None, lambda_run_max: int | None = None) ->
         )
         alert_send = telegram.send_message(
             cfg.telegram_chat_id,
-            f"Newsletter generation failed: first Gemini call failed.{run_lbl}",
+            "Newsletter generation failed",
         )
         log_event(
             logger,
