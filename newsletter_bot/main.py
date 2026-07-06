@@ -72,12 +72,6 @@ def mark_sent_now() -> None:
     LAST_SENT_FILE.write_text(utc_now_iso(), encoding="utf-8")
 
 
-def _lambda_run_label(lambda_run: int | None, lambda_run_max: int | None) -> str:
-    if lambda_run is None or lambda_run_max is None:
-        return ""
-    return f" [Lambda run {lambda_run}/{lambda_run_max}]"
-
-
 def _bullet_count(block: str) -> int:
     return sum(1 for line in block.strip().splitlines() if line.strip().startswith("- "))
 
@@ -105,7 +99,6 @@ def main(*, lambda_run: int | None = None, lambda_run_max: int | None = None) ->
     start = time.time()
     LOG_DIR.mkdir(parents=True, exist_ok=True)
     logger = get_logger(LOG_DIR)
-    run_lbl = _lambda_run_label(lambda_run, lambda_run_max)
 
     try:
         cfg = load_config()
@@ -142,17 +135,6 @@ def main(*, lambda_run: int | None = None, lambda_run_max: int | None = None) ->
             "Gemini call 1 (news) failed",
             error=str(exc),
             **_run_ctx,
-        )
-        alert_send = telegram.send_message(
-            cfg.telegram_chat_id,
-            "Newsletter generation failed",
-        )
-        log_event(
-            logger,
-            "error",
-            "Failure notice sent via Telegram",
-            alert_send_ok=alert_send.ok,
-            alert_send_status=alert_send.status_code,
         )
         return 1
 
@@ -212,17 +194,6 @@ def main(*, lambda_run: int | None = None, lambda_run_max: int | None = None) ->
                         total_parts=len(message_parts),
                         partial_delivery=True,
                     )
-                alt = telegram.send_message(
-                    cfg.telegram_chat_id,
-                    f"Partial newsletter send failed on part {idx}/{len(message_parts)}.{run_lbl}",
-                )
-                log_event(
-                    logger,
-                    "error",
-                    "Failure notice sent via Telegram (partial send)",
-                    alert_send_ok=alt.ok,
-                    alert_send_status=alt.status_code,
-                )
                 return 1
 
         mark_sent_now()
@@ -261,18 +232,7 @@ def main(*, lambda_run: int | None = None, lambda_run_max: int | None = None) ->
     try:
         message_parts = split_for_telegram(final_text, max_parts=2)
     except ValueError as exc:
-        alert_send = telegram.send_message(
-            cfg.telegram_chat_id,
-            f"Newsletter formatting failed: content exceeded Telegram constraints.{run_lbl}",
-        )
-        log_event(
-            logger,
-            "error",
-            "Formatting failure",
-            error=str(exc),
-            alert_send_ok=alert_send.ok,
-            alert_send_status=alert_send.status_code,
-        )
+        log_event(logger, "error", "Formatting failure", error=str(exc))
         return 1
 
     for idx, part in enumerate(message_parts, start=1):
@@ -299,17 +259,6 @@ def main(*, lambda_run: int | None = None, lambda_run_max: int | None = None) ->
                     parts_ok_before_fail=idx - 1,
                     total_parts=len(message_parts),
                 )
-            alert_send = telegram.send_message(
-                cfg.telegram_chat_id,
-                f"Newsletter send failed on part {idx}/{len(message_parts)}.{run_lbl}",
-            )
-            log_event(
-                logger,
-                "error",
-                "Failure notice sent via Telegram",
-                alert_send_ok=alert_send.ok,
-                alert_send_status=alert_send.status_code,
-            )
             return 1
 
     mark_sent_now()
@@ -339,7 +288,7 @@ def lambda_handler(event: object, context: object) -> dict[str, object]:
     apart as the invocation's remaining time allows: Lambda's own hard timeout (max 900s / 15m)
     cannot fit a strict 15m-then-30m schedule for 3 attempts, so the wait is capped (never
     skipped outright while any reasonable time remains) to keep ``attempt`` progressing —
-    this is what makes ``Lambda run X/Y`` in logs/alerts increment correctly instead of
+    this is what makes ``Lambda run X/Y`` in logs increment correctly instead of
     getting stuck at 1/Y. Only bails without retrying if under 5s of safe runway remain.
 
     No VPC → default outbound internet for Gemini + Telegram.

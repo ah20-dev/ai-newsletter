@@ -21,7 +21,7 @@ On each run, `main.py`:
    same digest twice the same day.
 3. **Gemini call 1 — Global news**: prompt asks for top ~12 headlines from the
    last 24h. Tool: `google_search` grounding. Output normalized to `- ` bullets
-   (`formatter.normalize_newsletter`). On failure: Telegram alert, exit `1` (no
+   (`formatter.normalize_newsletter`). On failure: CloudWatch log, exit `1` (no
    partial send).
 4. **Sleeps 75 seconds** to stay under Gemini per-minute rate limits.
 5. **Gemini call 2 — US market movers**: top ~20 stocks with `$TICKER`, `%`
@@ -36,14 +36,12 @@ On each run, `main.py`:
    sending on the full-newsletter path.
 7. **Splits** if the message exceeds Telegram's 4096-char limit, preferring the
    section boundary; max **2** parts (`formatter.split_for_telegram`).
-8. **Sends** via the Telegram Bot API. On send failure, posts an alert to
-   `TELEGRAM_CHAT_ID`.
+8. **Sends** via the Telegram Bot API. On send failure, logs error and exits `1`.
 9. **Marks success** by writing the current UTC ISO timestamp to
    `logs/last_sent.txt`.
 
 **Hard caps per run:** 2 Gemini calls; up to **2 Telegram newsletter parts** (split
-at section boundary). Failure **alerts** are separate short messages and do not
-count toward the part limit.
+at section boundary).
 
 ---
 
@@ -79,7 +77,7 @@ count toward the part limit.
 | **Process-level (whole run, EC2)** | **3 attempts** (1 + 2 retries), **15 minutes** between failures | `run_with_retry.sh` |
 | **Process-level (whole run, Lambda)** | Default **3 attempts** (1 + **2 retries**) within a single invocation, spaced as close to **15 minutes** apart as remaining execution time allows (adaptive — see caveat below). `LAMBDA_MAX_ATTEMPTS=1` disables retry. | `main.py::lambda_handler` |
 | **Idempotency** | Skip if `logs/last_sent.txt` is within the last `IDEMPOTENCY_WINDOW_HOURS` (default **20h**) | `main.py::should_skip_duplicate` |
-| **Failure alerting** | Each unrecoverable failure posts a short message to `TELEGRAM_CHAT_ID` | `main.py` |
+| **Failure logging** | Gemini / send failures logged to CloudWatch only; no Telegram failure alerts | `main.py` |
 
 Notes:
 - The 20h window is **less than the 24h cron cadence**, so the next scheduled
@@ -89,7 +87,7 @@ Notes:
   **EC2** `run_with_retry.sh` or **Lambda** `lambda_handler` retries the **whole**
   process on non-zero exit. (`validator.build_refined_prompt`
   exists for future use but is not currently wired in.)
-- **Lambda caveat (adaptive retry gap):** Lambda's **900 s hard timeout** cannot fit 2 full **15-minute** waits plus 3 runs in one invocation (15m + 15m alone exceeds the entire budget). Instead of skipping retries outright, `lambda_handler` shrinks each wait to whatever time remains (reserving `LAMBDA_POST_SLEEP_RESERVE_MS` for the next `main()` call), so `LAMBDA_RETRY_AFTER_FIRST_FAIL_MINUTES` is a **ceiling, not a guarantee**, on Lambda. This is what makes `Lambda run X/Y` in logs/alerts actually progress (1/3 → 2/3 → 3/3) instead of getting stuck at 1/Y — failures typically return fast (seconds), leaving plenty of runway for real retries even though each gap ends up shorter than 15 minutes. Retries only stop early if under 5s of safe runway remain. **EC2** `run_with_retry.sh` has no such cap and keeps the full 15-minute gaps.
+- **Lambda caveat (adaptive retry gap):** Lambda's **900 s hard timeout** cannot fit 2 full **15-minute** waits plus 3 runs in one invocation (15m + 15m alone exceeds the entire budget). Instead of skipping retries outright, `lambda_handler` shrinks each wait to whatever time remains (reserving `LAMBDA_POST_SLEEP_RESERVE_MS` for the next `main()` call), so `LAMBDA_RETRY_AFTER_FIRST_FAIL_MINUTES` is a **ceiling, not a guarantee**, on Lambda. This is what makes `Lambda run X/Y` in logs actually progress (1/3 → 2/3 → 3/3) instead of getting stuck at 1/Y — failures typically return fast (seconds), leaving plenty of runway for real retries even though each gap ends up shorter than 15 minutes. Retries only stop early if under 5s of safe runway remain. **EC2** `run_with_retry.sh` has no such cap and keeps the full 15-minute gaps.
 - **Multi-part Telegram send:** if part 1 succeeds and a later part fails, `main.py`
   still writes `last_sent.txt` so a process-level retry does not re-send part 1.
   Tradeoff: outer retry may skip until the idempotency window expires; delete
@@ -152,7 +150,7 @@ Exit code `0` = success; the newsletter should land in your Telegram chat.
 |----------|----------|-------------|
 | `GEMINI_API_KEY` | Yes | Gemini API key from Google AI Studio. |
 | `TELEGRAM_BOT_TOKEN` | Yes | Bot token from `@BotFather`. |
-| `TELEGRAM_CHAT_ID` | Yes | Chat ID that receives the newsletter and failure alerts. |
+| `TELEGRAM_CHAT_ID` | Yes | Chat ID that receives the newsletter. |
 | `GEMINI_MODEL` | No | Defaults to `gemini-2.5-flash-lite`. |
 | `REQUEST_TIMEOUT_SECONDS` | No | Telegram HTTP timeout. Default `20`. |
 | `IDEMPOTENCY_WINDOW_HOURS` | No | Skip-duplicate window. Default `20`. |
@@ -279,7 +277,7 @@ sudo systemctl status crond    # Amazon Linux
 
 | Symptom | Where to look |
 |---------|---------------|
-| Exit code 1 | EC2/local: `logs/run.log`. Lambda: CloudWatch log group. Last entries — Gemini call 1 error, Telegram error, or formatting error. Telegram chat may also get a failure alert. |
+| Exit code 1 | EC2/local: `logs/run.log`. Lambda: CloudWatch log group. Last entries — Gemini call 1 error, Telegram send error, or formatting error. |
 | Telegram shows `400` / parse errors | Messages use `parse_mode=Markdown`; odd `$` or `_` in bullets can break parsing. See `telegram_client.py`. |
 | No Telegram message arrived | Verify `TELEGRAM_BOT_TOKEN` and `TELEGRAM_CHAT_ID`; message your bot once from the target chat so the bot can reach it. |
 | Validation warnings only | Bullet count or ticker/`%` rule failed; the digest is still sent. Tune the prompts in `main.py` if you want stricter output. |
