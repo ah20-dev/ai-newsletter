@@ -23,7 +23,7 @@ variable "function_name" {
 
 variable "lambda_timeout_seconds" {
   type        = number
-  description = "Lambda timeout (default 900s = 15m max). Handler: default 1 run + 2 retries at +15m/+30m from first failure; plus 75s inter-Gemini sleep inside main(). Remaining-time guard may skip retries if next run would not fit. Tune env vars if runs are slower."
+  description = "Lambda timeout (default 900s = 15m max). Handler: default 1 run + 2 retries within this single invocation, gap adaptively shrunk to fit remaining time (LAMBDA_RETRY_AFTER_FIRST_FAIL_MINUTES is a ceiling, not a guarantee, given the 900s cap); plus 75s inter-Gemini sleep inside main(). Tune env vars if runs are slower."
   default     = 900
 }
 
@@ -76,7 +76,7 @@ variable "lambda_max_attempts" {
 variable "lambda_retry_after_first_fail_minutes" {
   type        = string
   default     = ""
-  description = "Optional LAMBDA_RETRY_AFTER_FIRST_FAIL_MINUTES (empty = app default 15)."
+  description = "Optional LAMBDA_RETRY_AFTER_FIRST_FAIL_MINUTES (empty = app default 15). Ceiling only; Lambda's 900s timeout forces shorter gaps in practice."
 }
 
 variable "lambda_post_sleep_reserve_ms" {

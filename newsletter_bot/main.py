@@ -332,28 +332,25 @@ def main(*, lambda_run: int | None = None, lambda_run_max: int | None = None) ->
 
 
 def lambda_handler(event: object, context: object) -> dict[str, object]:
-    """EventBridge / console invoke. Lambda: default **3** full runs (1 + 2 retries).
+    """EventBridge / console invoke. Lambda: default **3** full runs (1 + 2 retries),
+    all within this single invocation.
 
-    After each failed ``main()``, waits until the next **15-minute** slot from the first
-    failure (15m, then 30m), then runs ``main()`` again.
-
-    ``LAMBDA_MAX_ATTEMPTS`` may be ``1`` (no retry) or higher. Spacing uses
-    ``LAMBDA_RETRY_AFTER_FIRST_FAIL_MINUTES`` × attempt index from first failure.
+    After each failed ``main()``, retries as close to ``LAMBDA_RETRY_AFTER_FIRST_FAIL_MINUTES``
+    apart as the invocation's remaining time allows: Lambda's own hard timeout (max 900s / 15m)
+    cannot fit a strict 15m-then-30m schedule for 3 attempts, so the wait is capped (never
+    skipped outright while any reasonable time remains) to keep ``attempt`` progressing —
+    this is what makes ``Lambda run X/Y`` in logs/alerts increment correctly instead of
+    getting stuck at 1/Y. Only bails without retrying if under 5s of safe runway remain.
 
     No VPC → default outbound internet for Gemini + Telegram.
-    Skips further retries if remaining Lambda time cannot fit sleep + another full ``main()``.
     """
     logger = get_logger(LOG_DIR)
 
     if LAMBDA_MAX_ATTEMPTS < 1:
         raise ValueError(f"LAMBDA_MAX_ATTEMPTS must be >= 1; got {LAMBDA_MAX_ATTEMPTS}.")
 
-    retry_at_s = tuple(
-        LAMBDA_RETRY_AFTER_FIRST_FAIL_MINUTES * 60 * (i + 1)
-        for i in range(max(0, LAMBDA_MAX_ATTEMPTS - 1))
-    )
-
-    t_first_fail: float | None = None
+    configured_gap_seconds = LAMBDA_RETRY_AFTER_FIRST_FAIL_MINUTES * 60
+    reserve_seconds = LAMBDA_POST_SLEEP_RESERVE_MS / 1000.0
 
     for attempt in range(1, LAMBDA_MAX_ATTEMPTS + 1):
         code = main(lambda_run=attempt, lambda_run_max=LAMBDA_MAX_ATTEMPTS)
@@ -371,43 +368,40 @@ def lambda_handler(event: object, context: object) -> dict[str, object]:
             )
             return {"ok": False, "exit": code, "attempt": attempt}
 
-        if t_first_fail is None:
-            t_first_fail = time.time()
-
-        target_monotonic = t_first_fail + float(retry_at_s[attempt - 1])
-        delay = max(0.0, target_monotonic - time.time())
-
         remaining_ms: int | None = None
         if context is not None and callable(getattr(context, "get_remaining_time_in_ms", None)):
             remaining_ms = int(context.get_remaining_time_in_ms())
 
-        min_remaining_ms = int(delay * 1000) + LAMBDA_POST_SLEEP_RESERVE_MS
-        if remaining_ms is not None and remaining_ms < min_remaining_ms:
-            log_event(
-                logger,
-                "warning",
-                "Lambda handler skipping further retries (insufficient time left)",
-                attempt=attempt,
-                delay_seconds=round(delay, 2),
-                remaining_ms=remaining_ms,
-                min_remaining_ms=min_remaining_ms,
-                exit=code,
-            )
-            return {
-                "ok": False,
-                "exit": code,
-                "attempt": attempt,
-                "reason": "insufficient_time_for_scheduled_retry",
-            }
+        if remaining_ms is None:
+            # No Lambda context (e.g. local invocation): honor the configured gap as-is.
+            delay = float(configured_gap_seconds)
+        else:
+            available_seconds = (remaining_ms / 1000.0) - reserve_seconds
+            if available_seconds <= 5:
+                log_event(
+                    logger,
+                    "warning",
+                    "Lambda handler skipping further retries (no time left this invocation)",
+                    attempt=attempt,
+                    remaining_ms=remaining_ms,
+                    exit=code,
+                )
+                return {
+                    "ok": False,
+                    "exit": code,
+                    "attempt": attempt,
+                    "reason": "insufficient_time_for_scheduled_retry",
+                }
+            delay = min(float(configured_gap_seconds), available_seconds)
 
         log_event(
             logger,
             "info",
-            "Lambda handler retry wait (wall time from first failure)",
+            "Lambda handler retry wait",
             attempt=attempt,
             delay_seconds=round(delay, 2),
             next_attempt=attempt + 1,
-            retry_anchor_minutes=retry_at_s[attempt - 1] // 60,
+            configured_gap_seconds=configured_gap_seconds,
         )
         time.sleep(delay)
 
